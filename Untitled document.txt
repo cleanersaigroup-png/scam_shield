@@ -1,0 +1,1280 @@
+﻿import os
+import re
+from datetime import datetime
+import pandas as pd
+import joblib
+from flask import Flask, jsonify, render_template_string, request
+from translate import Translator
+
+
+app = Flask(__name__)
+
+
+# Supported Target Languages
+LANG_MAP = {
+    "en": "English",
+    "hi": "Hindi",
+    "ml": "Malayalam",
+    "mr": "Marathi",
+    "ta": "Tamil",
+}
+
+
+
+
+# Translation Helper Function using `translate` library
+def translate_text(text, target_lang):
+    if not text or target_lang == "en":
+        return text
+    try:
+        translator = Translator(to_lang=target_lang)
+        return translator.translate(text)
+    except Exception as e:
+        print(f"Translation Error ({target_lang}):", e)
+        return text
+
+
+
+
+# ============================================================
+# LOAD AI MODEL
+# ============================================================
+
+
+MODEL_FILE = "scam_detector.pkl"
+TFIDF_FILE = "tfidf.pkl"
+
+
+try:
+    model = joblib.load(MODEL_FILE)
+    tfidf = joblib.load(TFIDF_FILE)
+    MODEL_READY = True
+except Exception as e:
+    print("Model loading error (will run heuristics mode if pkl missing):", e)
+    MODEL_READY = False
+
+
+# ============================================================
+# DATABASE FILES
+# ============================================================
+
+
+REPUTATION_FILE = "reputation.csv"
+COMMUNITY_FILE = "community_reports.csv"
+
+
+if not os.path.exists(REPUTATION_FILE):
+    pd.DataFrame(columns=["phone_number", "reports", "category"]).to_csv(
+        REPUTATION_FILE, index=False
+    )
+
+
+if not os.path.exists(COMMUNITY_FILE):
+    pd.DataFrame(
+        columns=["phone_number", "category", "description", "timestamp"]
+    ).to_csv(COMMUNITY_FILE, index=False)
+
+
+
+
+def normalize_phone(phone):
+    if not phone:
+        return ""
+    digits = re.sub(r"\D", "", str(phone))
+    if len(digits) >= 10:
+        return digits[-10:]
+    return digits
+
+
+
+
+def get_reputation(phone):
+    phone = normalize_phone(phone)
+    if not phone:
+        return {"found": False, "reports": 0, "category": "Unknown"}
+    try:
+        df = pd.read_csv(REPUTATION_FILE)
+        if df.empty:
+            return {"found": False, "reports": 0, "category": "Unknown"}
+        df["phone_number"] = (
+            df["phone_number"].astype(str).apply(normalize_phone)
+        )
+        result = df[df["phone_number"] == phone]
+        if result.empty:
+            return {"found": False, "reports": 0, "category": "Unknown"}
+        return {
+            "found": True,
+            "reports": int(result.iloc[0]["reports"]),
+            "category": str(result.iloc[0].get("category", "Reported")),
+        }
+    except Exception as e:
+        print("Reputation error:", e)
+        return {"found": False, "reports": 0, "category": "Unknown"}
+
+
+
+
+def get_community_reports(phone):
+    phone = normalize_phone(phone)
+    if not phone:
+        return []
+    try:
+        df = pd.read_csv(COMMUNITY_FILE)
+        if df.empty:
+            return []
+        df["phone_number"] = (
+            df["phone_number"].astype(str).apply(normalize_phone)
+        )
+        results = df[df["phone_number"] == phone]
+        reports = []
+        for _, row in results.iterrows():
+            reports.append(
+                {
+                    "category": str(row.get("category", "Other")),
+                    "description": str(row.get("description", "")),
+                    "timestamp": str(row.get("timestamp", "")),
+                }
+            )
+        return reports
+    except Exception as e:
+        print("Community database error:", e)
+        return []
+
+
+
+
+def add_community_report(phone, category, description):
+    phone = normalize_phone(phone)
+    if not phone:
+        return False
+    try:
+        df = pd.read_csv(COMMUNITY_FILE)
+        new_row = pd.DataFrame(
+            [
+                {
+                    "phone_number": phone,
+                    "category": category,
+                    "description": description,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            ]
+        )
+        df = pd.concat([df, new_row], ignore_index=True)
+        df.to_csv(COMMUNITY_FILE, index=False)
+        return True
+    except Exception as e:
+        print("Could not save report:", e)
+        return False
+
+
+
+
+def community_risk_score(report_count):
+    if report_count == 0:
+        return 0
+    if report_count <= 2:
+        return 30
+    if report_count <= 4:
+        return 55
+    if report_count <= 9:
+        return 75
+    return 90
+
+
+
+
+def detect_language(text):
+    if not text:
+        return "Unknown"
+    devanagari = len(re.findall(r"[\u0900-\u097F]", text))
+    english = len(re.findall(r"[A-Za-z]", text))
+    total = devanagari + english
+    if total == 0:
+        return "Unknown"
+    if devanagari > 0 and english > 0:
+        return (
+            "Hindi + English" if (devanagari / total) > 0.25 else "Hinglish"
+        )
+    if devanagari > 0:
+        return "Hindi"
+    return "English / Hinglish"
+
+
+
+
+def normalize_text(text):
+    text = text.lower()
+    text = text.replace("।", ".").replace("—", " ").replace("–", " ")
+    return text
+
+
+
+
+def detect_scam_techniques(message):
+    text = normalize_text(message)
+    techniques = []
+
+
+    urgency_words = [
+        "urgent",
+        "immediately",
+        "immediate",
+        "now",
+        "right now",
+        "within",
+        "today",
+        "hurry",
+        "act fast",
+        "limited time",
+        "तुरंत",
+        "अभी",
+        "जल्दी",
+        "शीघ्र",
+        "फौरन",
+        "आज ही",
+        "तत्काल",
+    ]
+    threat_words = [
+        "blocked",
+        "block",
+        "suspended",
+        "suspend",
+        "closed",
+        "closure",
+        "deactivated",
+        "terminate",
+        "penalty",
+        "legal action",
+        "arrest",
+        "fine",
+        "account will be closed",
+        "बंद",
+        "ब्लॉक",
+        "निलंबित",
+        "सस्पेंड",
+        "रद्द",
+        "जुर्माना",
+        "कानूनी कार्रवाई",
+        "गिरफ्तार",
+        "खाता बंद",
+    ]
+    credential_words = [
+        "otp",
+        "one time password",
+        "password",
+        "pin",
+        "cvv",
+        "card number",
+        "account details",
+        "login details",
+        "verification code",
+        "ओटीपी",
+        "पासवर्ड",
+        "पिन",
+        "सीवीवी",
+        "कार्ड नंबर",
+        "खाते की जानकारी",
+        "सत्यापन कोड",
+    ]
+    payment_words = [
+        "pay",
+        "payment",
+        "transfer",
+        "send money",
+        "upi",
+        "bank transfer",
+        "deposit",
+        "fee",
+        "charge",
+        "₹",
+        "rs",
+        "rupees",
+        "भुगतान",
+        "पैसे",
+        "रुपये",
+        "पैसा भेजें",
+        "यूपीआई",
+        "जमा",
+    ]
+    reward_words = [
+        "lottery",
+        "winner",
+        "won",
+        "prize",
+        "reward",
+        "cash prize",
+        "lucky",
+        "gift",
+        "free",
+        "इनाम",
+        "लॉटरी",
+        "पुरस्कार",
+        "जीते",
+        "विजेता",
+        "उपहार",
+        "मुफ्त",
+    ]
+    authority_words = [
+        "bank",
+        "police",
+        "government",
+        "income tax",
+        "rbi",
+        "kyc",
+        "customer care",
+        "official",
+        "department",
+        "सरकार",
+        "बैंक",
+        "पुलिस",
+        "आयकर",
+        "आरबीआई",
+        "केवाईसी",
+        "ग्राहक सेवा",
+        "अधिकारी",
+        "विभाग",
+    ]
+    investment_words = [
+        "investment",
+        "invest",
+        "profit",
+        "return",
+        "double your money",
+        "guaranteed return",
+        "crypto",
+        "trading",
+        "निवेश",
+        "मुनाफा",
+        "लाभ",
+        "पैसा दोगुना",
+        "गारंटीड रिटर्न",
+        "क्रिप्टो",
+        "ट्रेडिंग",
+    ]
+
+
+    if [w for w in urgency_words if w in text]:
+        techniques.append(
+            {
+                "type": "Urgency",
+                "severity": "medium",
+                "icon": "⏱️",
+                "title": "Creates urgency",
+                "description": "The message pressures you to act quickly.",
+            }
+        )
+    if [w for w in threat_words if w in text]:
+        techniques.append(
+            {
+                "type": "Threat",
+                "severity": "high",
+                "icon": "⚠️",
+                "title": "Uses fear or threats",
+                "description": (
+                    "The message threatens a negative consequence if you do not"
+                    " act."
+                ),
+            }
+        )
+    if [w for w in credential_words if w in text]:
+        techniques.append(
+            {
+                "type": "Credential Request",
+                "severity": "high",
+                "icon": "🔐",
+                "title": "Requests sensitive information",
+                "description": (
+                    "The message mentions OTPs, passwords, PINs or financial"
+                    " details."
+                ),
+            }
+        )
+    if [w for w in payment_words if w in text]:
+        techniques.append(
+            {
+                "type": "Financial Request",
+                "severity": "high",
+                "icon": "💳",
+                "title": "Involves money or payment",
+                "description": (
+                    "The message involves a payment, transfer or financial"
+                    " transaction."
+                ),
+            }
+        )
+    if [w for w in reward_words if w in text]:
+        techniques.append(
+            {
+                "type": "Reward Bait",
+                "severity": "high",
+                "icon": "🎁",
+                "title": "Uses a reward or prize",
+                "description": (
+                    "The message tries to attract you with an unexpected reward"
+                    " or prize."
+                ),
+            }
+        )
+    if [w for w in authority_words if w in text]:
+        techniques.append(
+            {
+                "type": "Authority Impersonation",
+                "severity": "medium",
+                "icon": "🏦",
+                "title": "Uses authority language",
+                "description": (
+                    "The message refers to a bank, government body or official"
+                    " service."
+                ),
+            }
+        )
+    if [w for w in investment_words if w in text]:
+        techniques.append(
+            {
+                "type": "Investment Bait",
+                "severity": "high",
+                "icon": "📈",
+                "title": "Promotes financial returns",
+                "description": (
+                    "The message promises investment profits or unusually"
+                    " attractive returns."
+                ),
+            }
+        )
+
+
+    return techniques
+
+
+
+
+def analyze_url(message):
+    urls = re.findall(r"(https?://[^\s]+|www\.[^\s]+)", message.lower())
+    if not urls:
+        return {
+            "found": False,
+            "suspicious": False,
+            "score": 0,
+            "urls": [],
+            "reasons": [],
+        }
+    reasons, suspicious = [], False
+    for url in urls:
+        clean_url = url.rstrip(".,!?)]}")
+        if clean_url.startswith("http://"):
+            suspicious = True
+            reasons.append("The link does not use HTTPS.")
+        if re.search(r"https?://\d{1,3}(\.\d{1,3}){3}", clean_url):
+            suspicious = True
+            reasons.append("The URL uses a raw IP address.")
+        if any(
+            x in clean_url
+            for x in [
+                "bit.ly",
+                "tinyurl.com",
+                "t.co",
+                "goo.gl",
+                "is.gd",
+                "cutt.ly",
+                "shorturl.at",
+            ]
+        ):
+            suspicious = True
+            reasons.append("The link uses a URL-shortening service.")
+        matches = [
+            w
+            for w in [
+                "verify",
+                "login",
+                "secure",
+                "account",
+                "kyc",
+                "update",
+                "refund",
+                "reward",
+                "claim",
+                "wallet",
+                "password",
+            ]
+            if w in clean_url
+        ]
+        if matches:
+            suspicious = True
+            reasons.append("The URL contains keywords: " + ", ".join(matches))
+    score = min(90, 40 + len(reasons) * 10) if suspicious else 0
+    return {
+        "found": True,
+        "suspicious": suspicious,
+        "score": score,
+        "urls": urls,
+        "reasons": reasons,
+    }
+
+
+
+
+def detect_category(message):
+    text = normalize_text(message)
+    categories = {
+        "KYC / Banking Scam": [
+            "kyc",
+            "bank account",
+            "bank",
+            "account blocked",
+            "केवाईसी",
+            "बैंक खाता",
+            "बैंक",
+        ],
+        "OTP Scam": [
+            "otp",
+            "one time password",
+            "verification code",
+            "ओटीपी",
+        ],
+        "UPI / Payment Scam": [
+            "upi",
+            "payment",
+            "pay",
+            "transfer",
+            "qr code",
+            "भुगतान",
+            "यूपीआई",
+        ],
+        "Lottery / Prize Scam": [
+            "lottery",
+            "prize",
+            "winner",
+            "reward",
+            "लॉटरी",
+            "इनाम",
+        ],
+        "Job Scam": [
+            "job offer",
+            "work from home",
+            "vacancy",
+            "salary",
+            "नौकरी",
+            "भर्ती",
+        ],
+        "Investment Scam": [
+            "investment",
+            "invest",
+            "profit",
+            "trading",
+            "निवेश",
+            "मुनाफा",
+        ],
+        "Loan Scam": ["loan", "instant loan", "लोन", "ऋण"],
+        "Courier Scam": [
+            "courier",
+            "parcel",
+            "delivery",
+            "कूरियर",
+            "पार्सल",
+        ],
+    }
+    best_cat, max_sc = "General Suspicious", 0
+    for cat, kws in categories.items():
+        sc = sum(1 for kw in kws if kw in text)
+        if sc > max_sc:
+            max_sc = sc
+            best_cat = cat
+    return best_cat
+
+
+
+
+def model_prediction(message):
+    if not MODEL_READY:
+        return {"probability": 0, "prediction": "Unknown"}
+    try:
+        X = tfidf.transform([message])
+        scam_prob = float(model.predict_proba(X)[0][1])
+        return {
+            "probability": round(scam_prob * 100, 2),
+            "prediction": "Scam" if scam_prob >= 0.5 else "Likely Safe",
+        }
+    except Exception as e:
+        print("Prediction error:", e)
+        return {"probability": 0, "prediction": "Unknown"}
+
+
+
+
+def generate_explanation(
+    message, model_score, url_data, phone_data, community_count, techniques
+):
+    explanations = []
+    if model_score >= 80:
+        explanations.append(
+            {
+                "severity": "high",
+                "icon": "🤖",
+                "title": "AI model detected strong scam patterns",
+                "description": (
+                    "The trained scam detector gave this message a"
+                    f" {model_score:.0f}% scam probability."
+                ),
+            }
+        )
+    elif model_score >= 50:
+        explanations.append(
+            {
+                "severity": "medium",
+                "icon": "🤖",
+                "title": "AI model detected suspicious patterns",
+                "description": (
+                    "The trained scam detector gave this message a"
+                    f" {model_score:.0f}% scam probability."
+                ),
+            }
+        )
+
+
+    for tech in techniques:
+        explanations.append(
+            {
+                "severity": tech["severity"],
+                "icon": tech["icon"],
+                "title": tech["title"],
+                "description": tech["description"],
+            }
+        )
+
+
+    if url_data["suspicious"]:
+        explanations.append(
+            {
+                "severity": "high",
+                "icon": "🔗",
+                "title": "Suspicious URL detected",
+                "description": (
+                    "The message contains a link with characteristics commonly"
+                    " associated with suspicious messages."
+                ),
+            }
+        )
+
+
+    if community_count >= 3:
+        explanations.append(
+            {
+                "severity": "high" if community_count >= 10 else "medium",
+                "icon": "🚨" if community_count >= 10 else "👥",
+                "title": "Community reports found",
+                "description": (
+                    f"The phone number has {community_count} community"
+                    " report(s)."
+                ),
+            }
+        )
+
+
+    if phone_data["reports"] > 0:
+        explanations.append(
+            {
+                "severity": "high" if phone_data["reports"] >= 5 else "medium",
+                "icon": "📱",
+                "title": "Previous reports found",
+                "description": (
+                    "The number appears in reputation database with"
+                    f" {phone_data['reports']} report(s)."
+                ),
+            }
+        )
+
+
+    return explanations
+
+
+
+
+def generate_action_plan(category):
+    plans = {
+        "KYC / Banking Scam": [
+            "Do not click the link.",
+            "Never share OTP, PIN, CVV or passwords.",
+            "Contact your bank only through its official app or website.",
+        ],
+        "OTP Scam": [
+            "Never share an OTP with anyone.",
+            "Do not enter the OTP into a suspicious website.",
+            "Contact the relevant service through official channels.",
+        ],
+        "UPI / Payment Scam": [
+            "Do not transfer money.",
+            "Do not scan an unknown QR code.",
+            (
+                "Verify the recipient independently before making any"
+                " payment."
+            ),
+        ],
+        "Lottery / Prize Scam": [
+            "Do not pay a fee to claim an unexpected prize.",
+            "Do not share banking information.",
+            "Verify the offer through an official source.",
+        ],
+        "Investment Scam": [
+            "Do not invest based only on an unsolicited message.",
+            "Be suspicious of guaranteed or unusually high returns.",
+            "Verify the investment platform independently.",
+        ],
+        "Job Scam": [
+            "Do not pay an upfront recruitment fee.",
+            "Verify the employer independently.",
+            "Do not share sensitive identity or banking information.",
+        ],
+        "Loan Scam": [
+            "Do not pay unknown processing fees.",
+            "Verify the lender independently.",
+            "Avoid sharing sensitive financial information.",
+        ],
+        "Courier Scam": [
+            "Verify the parcel through the official courier website.",
+            "Do not pay unexpected charges through an unknown link.",
+            "Do not share OTPs or banking details.",
+        ],
+    }
+    return plans.get(
+        category,
+        [
+            "Do not click suspicious links.",
+            "Do not share OTPs, passwords or financial information.",
+            "Verify the sender independently before taking action.",
+        ],
+    )
+
+
+
+
+def calculate_risk(
+    ai_score, url_data, reputation_data, community_count, techniques
+):
+    signals, weights = [ai_score], [0.70]
+    if url_data["found"]:
+        signals.append(url_data["score"])
+        weights.append(0.15)
+    if reputation_data["reports"] > 0:
+        signals.append(min(90, reputation_data["reports"] * 10))
+        weights.append(0.15)
+    if community_count > 0:
+        signals.append(community_risk_score(community_count))
+        weights.append(0.15)
+
+
+    if not signals:
+        return 0
+    risk = sum(s * w for s, w in zip(signals, weights)) / sum(weights)
+    if len(techniques) >= 3:
+        risk = max(risk, 70)
+    if len(techniques) >= 4:
+        risk = max(risk, 85)
+    return round(min(100, max(0, risk)), 1)
+
+
+
+
+def risk_label(score):
+    if score >= 75:
+        return "HIGH RISK"
+    if score >= 45:
+        return "MEDIUM RISK"
+    return "LOW RISK"
+
+
+
+
+REPORT_CATEGORIES = [
+    "UPI / Payment Scam",
+    "KYC / Banking Scam",
+    "OTP Scam",
+    "Job Scam",
+    "Investment Scam",
+    "Lottery / Prize Scam",
+    "Courier Scam",
+    "Loan Scam",
+    "Other",
+]
+
+
+HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Scam Shield</title>
+<style>
+*{ box-sizing:border-box; }
+body{
+    margin:0; font-family: Inter, Arial, sans-serif; min-height:100vh; color:#f5f7ff;
+    background: radial-gradient(circle at top left, #263b70, transparent 35%),
+                radial-gradient(circle at bottom right, #55235e, transparent 35%), #080b14;
+}
+.container{ width:min(1100px,94%); margin:auto; padding:35px 0 60px; }
+header{ text-align:center; margin-bottom:30px; }
+.logo{ font-size:48px; margin-bottom:5px; }
+h1{ margin:0; font-size:38px; }
+.subtitle{ color:#aab3c8; margin-top:10px; font-size:16px; }
+.card{
+    background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.12);
+    border-radius:22px; padding:24px; margin-bottom:20px; backdrop-filter:blur(18px);
+    box-shadow: 0 20px 50px rgba(0,0,0,0.25);
+}
+label{ display:block; margin-bottom:8px; color:#cbd3e6; font-weight:600; }
+input, textarea, select{
+    width:100%; border:none; outline:none; padding:15px; border-radius:14px;
+    background: rgba(255,255,255,0.08); color:white; border: 1px solid rgba(255,255,255,0.1);
+    margin-bottom:18px; font-size:15px;
+}
+select option { background: #1f2937; color: white; }
+textarea{ min-height:140px; resize:vertical; }
+button{
+    border:none; border-radius:14px; padding:13px 20px; cursor:pointer;
+    font-weight:700; font-size:15px; background:#6d7cff; color:white; transition:0.2s;
+}
+button:hover{ transform:translateY(-2px); filter:brightness(1.12); }
+.secondary{ background: rgba(255,255,255,0.1); }
+.speak-btn{ background:#10b981; }
+.stop-btn{ background:#ef4444; }
+.button-row{ display:flex; gap:12px; flex-wrap:wrap; }
+.hidden{ display:none; }
+.result-header{ display:grid; grid-template-columns: repeat(4,1fr); gap:14px; }
+.stat{ padding:18px; border-radius:17px; background: rgba(255,255,255,0.06); }
+.stat-title{ color:#9da8bf; font-size:13px; margin-bottom:8px; }
+.stat-value{ font-size:23px; font-weight:800; }
+.high{ color:#ff6b81; } .medium{ color:#ffc45c; } .low{ color:#65e6a4; }
+.section-title{ font-size:21px; margin-bottom:17px; }
+.explanation{ display:flex; gap:14px; padding:17px; margin-bottom:12px; border-radius:16px; background: rgba(255,255,255,0.055); border-left: 4px solid #777; }
+.explanation.high{ border-left-color:#ff526d; }
+.explanation.medium{ border-left-color:#ffc45c; }
+.explanation.low{ border-left-color:#65e6a4; }
+.explain-icon{ font-size:25px; }
+.explain-title{ font-weight:800; margin-bottom:5px; color:white; }
+.explain-description{ color:#aeb8cc; line-height:1.5; font-size:14px; }
+.badge{ display:inline-block; padding:6px 10px; border-radius:30px; background: rgba(255,255,255,0.08); color:#cbd3e6; font-size:13px; margin:3px; }
+.action{ padding:12px 0; color:#d6dced; }
+.action::before{ content:"✓ "; color:#67e8a5; font-weight:bold; }
+.alert{ padding:16px; border-radius:15px; background: rgba(255,80,100,0.1); border: 1px solid rgba(255,80,100,0.25); margin-bottom:15px; }
+.safe{ background: rgba(70,220,140,0.08); border: 1px solid rgba(70,220,140,0.2); }
+.report-box{ border-top: 1px solid rgba(255,255,255,0.1); margin-top:25px; padding-top:25px; }
+.footer{ text-align:center; color:#737d93; font-size:13px; margin-top:25px; }
+@media(max-width:750px){ h1{ font-size:30px; } .result-header{ grid-template-columns: repeat(2,1fr); } .card{ padding:18px; } }
+</style>
+</head>
+<body>
+<div class="container">
+<header>
+<div class="logo">🛡️</div>
+<h1>AI Scam Shield</h1>
+<div class="subtitle">AI-powered scam detection with Multilingual Output & Audio Read-Aloud</div>
+</header>
+
+
+<div class="card">
+<label>Select Output Language</label>
+<select id="targetLanguage">
+    <option value="en">English</option>
+    <option value="hi">Hindi (हिंदी)</option>
+    <option value="ml">Malayalam (മലയാളം)</option>
+    <option value="mr">Marathi (मराठी)</option>
+    <option value="ta">Tamil (தமிழ்)</option>
+</select>
+
+
+<label>Phone Number <span style="color:#8993aa">(optional)</span></label>
+<input id="phone" type="tel" placeholder="Enter phone number if available">
+
+
+<label>Message</label>
+<textarea id="message" placeholder="Paste the SMS / WhatsApp message here..."></textarea>
+
+
+<div class="button-row">
+<button onclick="analyze()">🔍 Analyze Message</button>
+<button class="secondary" onclick="clearAll()">Clear</button>
+</div>
+</div>
+
+
+<div id="results" class="hidden">
+
+
+<div class="card button-row">
+<button class="speak-btn" onclick="speakResults()">🔊 Listen / Read Aloud</button>
+<button class="stop-btn" onclick="stopSpeech()">⏹️ Stop Audio</button>
+</div>
+
+
+<div class="card">
+<div class="result-header">
+<div class="stat"><div class="stat-title">RISK SCORE</div><div id="riskScore" class="stat-value">--</div></div>
+<div class="stat"><div class="stat-title">RISK LEVEL</div><div id="riskLabel" class="stat-value">--</div></div>
+<div class="stat"><div class="stat-title">CATEGORY</div><div id="category" class="stat-value" style="font-size:16px">--</div></div>
+<div class="stat"><div class="stat-title">DETECTED SCRIPT</div><div id="language" class="stat-value" style="font-size:16px">--</div></div>
+</div>
+</div>
+
+
+<div class="card">
+<div class="section-title">🔍 Why does this message look suspicious?</div>
+<div id="explanations"></div>
+</div>
+
+
+<div class="card">
+<div class="section-title">🧠 Scam Techniques Detected</div>
+<div id="techniques"></div>
+</div>
+
+
+<div class="card">
+<div class="section-title">📱 Phone Intelligence</div>
+<div id="phoneInfo"></div>
+</div>
+
+
+<div class="card">
+<div class="section-title">🛡️ What should you do?</div>
+<div id="actions"></div>
+</div>
+
+
+<div class="card">
+<div class="section-title">🚨 Community Alert</div>
+<div id="communityAlert"></div>
+
+
+<div class="report-box">
+<h3>Report This Number</h3>
+<p style="color:#9da8bf">If you believe this number is involved in a scam, add a community report.</p>
+<select id="reportCategory">
+<option>UPI / Payment Scam</option><option>KYC / Banking Scam</option><option>OTP Scam</option>
+<option>Job Scam</option><option>Investment Scam</option><option>Lottery / Prize Scam</option>
+<option>Courier Scam</option><option>Loan Scam</option><option>Other</option>
+</select>
+<textarea id="reportDescription" placeholder="Optional description..." style="min-height:90px"></textarea>
+<button onclick="submitReport()">🚨 Submit Community Report</button>
+</div>
+</div>
+</div>
+
+
+<div class="footer">AI Scam Shield • Educational / Safety Project</div>
+</div>
+
+
+<script>
+let lastAnalysisText = "";
+
+
+async function analyze(){
+    stopSpeech();
+    const message = document.getElementById("message").value.trim();
+    const phone = document.getElementById("phone").value.trim();
+    const target_lang = document.getElementById("targetLanguage").value;
+
+
+    if(!message){
+        alert("Please enter a message first.");
+        return;
+    }
+
+
+    const response = await fetch("/predict", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({ message, phone, target_lang })
+    });
+
+
+    const data = await response.json();
+    if(data.error){ alert(data.error); return; }
+
+
+    document.getElementById("results").classList.remove("hidden");
+    document.getElementById("riskScore").textContent = data.risk_score + "/100";
+
+
+    const riskLabel = document.getElementById("riskLabel");
+    riskLabel.textContent = data.risk_label;
+    riskLabel.className = "stat-value " + (data.risk_score >= 75 ? "high" : data.risk_score >= 45 ? "medium" : "low");
+
+
+    document.getElementById("category").textContent = data.category;
+    document.getElementById("language").textContent = data.language;
+
+
+    const explanationBox = document.getElementById("explanations");
+    explanationBox.innerHTML = "";
+    data.explanations.forEach(item => {
+        explanationBox.innerHTML += `
+            <div class="explanation ${item.severity}">
+                <div class="explain-icon">${item.icon}</div>
+                <div>
+                    <div class="explain-title">${escapeHtml(item.title)}</div>
+                    <div class="explain-description">${escapeHtml(item.description)}</div>
+                </div>
+            </div>`;
+    });
+
+
+    const techniqueBox = document.getElementById("techniques");
+    techniqueBox.innerHTML = "";
+    if(data.techniques.length === 0){
+        techniqueBox.innerHTML = '<span class="badge">No obvious scam technique detected</span>';
+    } else {
+        data.techniques.forEach(item => {
+            techniqueBox.innerHTML += `<span class="badge">${item.icon} ${escapeHtml(item.type)}</span>`;
+        });
+    }
+
+
+    const phoneBox = document.getElementById("phoneInfo");
+    if(!phone){
+        phoneBox.innerHTML = `<div class="alert safe">📱 No phone number provided.</div>`;
+    } else {
+        phoneBox.innerHTML = data.phone.reports > 0 ? 
+            `<div class="alert">⚠️ This number has <strong>${data.phone.reports}</strong> reputation report(s).<br>Category: ${escapeHtml(data.phone.category)}</div>` :
+            `<div class="alert safe">ℹ️ No previous reputation reports found.</div>`;
+    }
+
+
+    const actionBox = document.getElementById("actions");
+    actionBox.innerHTML = "";
+    data.action_plan.forEach(action => {
+        actionBox.innerHTML += `<div class="action">${escapeHtml(action)}</div>`;
+    });
+
+
+    const communityBox = document.getElementById("communityAlert");
+    if(data.community_reports === 0){
+        communityBox.innerHTML = `<div class="alert safe">👥 No community reports found.</div>`;
+    } else {
+        communityBox.innerHTML = `<div class="alert">🚨 <strong>Community Reports Found</strong>: ${data.community_reports} report(s).</div>`;
+    }
+
+
+    let speechParts = [
+        "Risk score is " + data.risk_score + " out of 100.",
+        "Risk level is " + data.risk_label + ".",
+        "Category is " + data.category + "."
+    ];
+
+
+    if(data.explanations.length > 0) {
+        speechParts.push("Key Findings:");
+        data.explanations.forEach(exp => speechParts.push(exp.title + ". " + exp.description));
+    }
+
+
+    if(data.action_plan.length > 0) {
+        speechParts.push("Recommended Actions:");
+        data.action_plan.forEach(act => speechParts.push(act));
+    }
+
+
+    lastAnalysisText = speechParts.join(" ");
+}
+
+
+function speakResults(){
+    stopSpeech();
+
+
+    if(!'speechSynthesis' in window){
+        alert("Text-to-speech is not supported in this browser.");
+        return;
+    }
+
+
+    if(!lastAnalysisText){
+        alert("Please analyze a message first.");
+        return;
+    }
+
+
+    const targetLang = document.getElementById("targetLanguage").value;
+    const utterance = new SpeechSynthesisUtterance(lastAnalysisText);
+
+
+    const langVoiceMap = {
+        'hi': 'hi-IN',
+        'ml': 'ml-IN',
+        'mr': 'mr-IN',
+        'ta': 'ta-IN',
+        'en': 'en-US'
+    };
+
+
+    utterance.lang = langVoiceMap[targetLang] || 'en-US';
+    utterance.rate = 0.9;
+    window.speechSynthesis.speak(utterance);
+}
+
+
+function stopSpeech(){
+    if('speechSynthesis' in window){
+        window.speechSynthesis.cancel();
+    }
+}
+
+
+async function submitReport(){
+    const phone = document.getElementById("phone").value.trim();
+    const category = document.getElementById("reportCategory").value;
+    const description = document.getElementById("reportDescription").value.trim();
+
+
+    if(!phone){ alert("Please enter a phone number."); return; }
+
+
+    const response = await fetch("/report", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({ phone, category, description })
+    });
+
+
+    const data = await response.json();
+    if(data.error){ alert(data.error); return; }
+    alert("Report submitted successfully.");
+    document.getElementById("reportDescription").value = "";
+    analyze();
+}
+
+
+function clearAll(){
+    stopSpeech();
+    document.getElementById("message").value = "";
+    document.getElementById("phone").value = "";
+    document.getElementById("results").classList.add("hidden");
+    lastAnalysisText = "";
+}
+
+
+function escapeHtml(text){
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+}
+</script>
+</body>
+</html>
+"""
+
+
+
+
+@app.route("/predict", methods=["POST"])
+def predict():
+    data = request.get_json()
+    message = str(data.get("message", "")).strip()
+    phone = str(data.get("phone", "")).strip()
+    target_lang = str(data.get("target_lang", "en")).strip()
+
+
+    if not message:
+        return jsonify({"error": "Message is required."}), 400
+
+
+    model_result = model_prediction(message)
+    ai_score = model_result["probability"]
+    category = detect_category(message)
+    language = detect_language(message)
+    techniques = detect_scam_techniques(message)
+    url_data = analyze_url(message)
+    phone_data = get_reputation(phone)
+    community_reports = get_community_reports(phone)
+    community_count = len(community_reports)
+
+
+    risk = calculate_risk(
+        ai_score, url_data, phone_data, community_count, techniques
+    )
+    explanations = generate_explanation(
+        message, ai_score, url_data, phone_data, community_count, techniques
+    )
+    action_plan = generate_action_plan(category)
+
+
+    if target_lang != "en":
+        category = translate_text(category, target_lang)
+        for tech in techniques:
+            tech["type"] = translate_text(tech["type"], target_lang)
+            tech["title"] = translate_text(tech["title"], target_lang)
+            tech["description"] = translate_text(
+                tech["description"], target_lang
+            )
+
+
+        for exp in explanations:
+            exp["title"] = translate_text(exp["title"], target_lang)
+            exp["description"] = translate_text(exp["description"], target_lang)
+
+
+        action_plan = [translate_text(act, target_lang) for act in action_plan]
+
+
+    return jsonify({
+        "risk_score": risk,
+        "risk_label": risk_label(risk),
+        "ai_probability": ai_score,
+        "prediction": model_result["prediction"],
+        "category": category,
+        "language": language,
+        "techniques": techniques,
+        "explanations": explanations,
+        "url": url_data,
+        "phone": {
+            "reports": phone_data["reports"],
+            "category": phone_data["category"],
+            "found": phone_data["found"],
+        },
+        "community_reports": community_count,
+        "action_plan": action_plan,
+    })
+
+
+
+
+@app.route("/report", methods=["POST"])
+def report():
+    data = request.get_json()
+    phone = str(data.get("phone", "")).strip()
+    category = str(data.get("category", "Other")).strip()
+    description = str(data.get("description", "")).strip()
+
+
+    normalized = normalize_phone(phone)
+    if len(normalized) != 10:
+        return jsonify(
+            {"error": "Please enter a valid 10-digit phone number."}
+        ), 400
+
+
+    if category not in REPORT_CATEGORIES:
+        category = "Other"
+
+
+    if not add_community_report(normalized, category, description):
+        return jsonify({"error": "Could not save report."}), 500
+
+
+    return jsonify({"success": True, "message": "Report submitted successfully."})
+
+
+
+
+@app.route("/")
+def home():
+    return render_template_string(HTML)
+
+
+
+
+if __name__ == "__main__":
+    print("\n" + "=" * 50)
+    print("🌐 AI Scam Shield running locally at: http://127.0.0.1:5000")
+    print("=" * 50 + "\n")
+    app.run(host="127.0.0.1", port=5000, debug=True)
